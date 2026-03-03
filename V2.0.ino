@@ -84,6 +84,7 @@ static void initBLE();
 static bool initBNO();
 static bool enableReports();
 static void handleSerialCommands();
+static void printFrameToSerial(const FrameV1 &f);
 
 // -------------------- BLE state --------------------
 static BLECharacteristic *pStepsChar = nullptr;
@@ -114,6 +115,15 @@ static uint32_t frame_seq = 0;
 static int64_t next_frame_us = 0;
 static const int64_t FRAME_PERIOD_US = 10000; // 100Hz
 static const uint8_t BLE_FRAME_DIV = 2;       // 2 => 50Hz notify; 1 => 100Hz
+static const uint8_t SERIAL_FRAME_DIV = 5;    // 5 => 20Hz serial output
+static const float CADENCE_EMA_ALPHA = 0.2f;
+static const float ANGLE_EMA_ALPHA = 0.15f;
+
+// -------------------- Smoothed outputs --------------------
+static float roll_f = 0.0f;
+static float pitch_f = 0.0f;
+static float yaw_f = 0.0f;
+static bool angle_filter_initialized = false;
 
 // -------------------- Quaternion utilities --------------------
 static inline Quat quatConj(const Quat &q) { return {q.w, -q.x, -q.y, -q.z}; }
@@ -177,10 +187,12 @@ static void sendFrameIfNeeded(const FrameV1 &f) {
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) override {
     deviceConnected = true;
+    Serial.println("BLE_EVENT,connected=1");
     sendStepCount(true);
   }
   void onDisconnect(BLEServer* pServer) override {
     deviceConnected = false;
+    Serial.println("BLE_EVENT,connected=0");
     BLEDevice::startAdvertising();
   }
 };
@@ -268,9 +280,24 @@ static void handleSerialCommands() {
         q_ref = q_latest;
         quatNormalize(q_ref);
         calib_ok = true;
+        angle_filter_initialized = false;
+        Serial.println("CALIB_EVENT,source=manual,status=ok");
       }
     }
   }
+}
+
+static void printFrameToSerial(const FrameV1 &f) {
+  Serial.print("FRAME");
+  Serial.print(",seq="); Serial.print(f.seq);
+  Serial.print(",t_ms="); Serial.print(f.t_ms);
+  Serial.print(",roll_deg="); Serial.print(f.roll_cd / 100.0f, 2);
+  Serial.print(",pitch_deg="); Serial.print(f.pitch_cd / 100.0f, 2);
+  Serial.print(",yaw_deg="); Serial.print(f.yaw_cd / 100.0f, 2);
+  Serial.print(",cadence_spm="); Serial.print(f.cadence_x10 / 10.0f, 1);
+  Serial.print(",steps="); Serial.print(f.steps);
+  Serial.print(",flags=0x"); Serial.print(f.flags, HEX);
+  Serial.print(",quat_acc="); Serial.println(f.quat_acc);
 }
 
 void setup() {
@@ -280,6 +307,9 @@ void setup() {
   bool ok = initBNO();
   initBLE();
 
+  Serial.print("IMU_EVENT,init_ok=");
+  Serial.println(ok ? 1 : 0);
+
   // Initialize state even if IMU init fails (BLE still works for debugging).
   stepCount = 0;
   sendStepCount(true);
@@ -287,6 +317,8 @@ void setup() {
   int64_t now = esp_timer_get_time();
   next_frame_us = now + FRAME_PERIOD_US;
   calib_capture_at_us = now + 2000000; // auto zero after 2s
+
+  Serial.println("BOOT_EVENT,version=2.0,frame_hz=100,ble_hz=50,serial_hz=20");
 }
 
 void loop() {
@@ -336,7 +368,8 @@ void loop() {
       if (lastStepUs != 0) {
         int64_t dt = t - lastStepUs;
         if (dt > 250000 && dt < 2000000) {
-          cadence_spm = 60.0f * 1000000.0f / (float)dt;
+          float cadence_new = 60.0f * 1000000.0f / (float)dt;
+          cadence_spm = cadence_spm * (1.0f - CADENCE_EMA_ALPHA) + cadence_new * CADENCE_EMA_ALPHA;
         }
       }
       lastStepUs = t;
@@ -350,6 +383,8 @@ void loop() {
     q_ref = q_latest;
     quatNormalize(q_ref);
     calib_ok = true;
+    angle_filter_initialized = false;
+    Serial.println("CALIB_EVENT,source=auto,status=ok");
   }
 
   // Fixed-rate framing at 100Hz
@@ -370,6 +405,21 @@ void loop() {
         quatNormalize(q_rel);
       }
       quatToEulerDeg(q_rel, roll, pitch, yaw);
+
+      if (!angle_filter_initialized) {
+        roll_f = roll;
+        pitch_f = pitch;
+        yaw_f = yaw;
+        angle_filter_initialized = true;
+      } else {
+        roll_f = roll_f * (1.0f - ANGLE_EMA_ALPHA) + roll * ANGLE_EMA_ALPHA;
+        pitch_f = pitch_f * (1.0f - ANGLE_EMA_ALPHA) + pitch * ANGLE_EMA_ALPHA;
+        yaw_f = yaw_f * (1.0f - ANGLE_EMA_ALPHA) + yaw * ANGLE_EMA_ALPHA;
+      }
+
+      roll = roll_f;
+      pitch = pitch_f;
+      yaw = yaw_f;
     }
 
     FrameV1 f{};
@@ -400,6 +450,10 @@ void loop() {
     // Send at a lower BLE rate for stability if desired.
     if (deviceConnected && (frame_seq % BLE_FRAME_DIV == 0)) {
       sendFrameIfNeeded(f);
+    }
+
+    if (frame_seq % SERIAL_FRAME_DIV == 0) {
+      printFrameToSerial(f);
     }
   }
 
